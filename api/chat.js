@@ -72,7 +72,7 @@ function carregarVadeMecum() {
   if (vadeMecumCarregado) return;
   
   try {
-    const filePath = path.join(__dirname, '../dados/vade-mecum.txt');
+    const filePath = path.join(__dirname, 'dados/vade-mecum.txt');
     vadeMecumText = fs.readFileSync(filePath, 'utf-8');
     vadeMecumCarregado = true;
     console.log(`✅ Vade Mecum carregado: ${(vadeMecumText.length / 1024 / 1024).toFixed(2)} MB`);
