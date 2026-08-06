@@ -1,6 +1,8 @@
-// api/chat.js - Backend do Assistente IA do CAED com Vade Mecum
+// api/chat.js - Backend do Assistente IA do CAED com Vade Mecum e fallback Cerebras
 const GROQ_API_KEY = process.env.CAED_GROQ_API_KEY;
+const CEREBRAS_API_KEY = process.env.CEREBRAS_API_KEY;
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const CEREBRAS_URL = "https://api.cerebras.ai/v1/chat/completions";
 
 // ============================================================
 // 1. PROMPT DO SISTEMA - CAED VERSÃO OFICIAL (ÚNICO)
@@ -110,7 +112,7 @@ function buscarNaBaseRapida(pergunta) {
 }
 
 // ============================================================
-// 4. BUSCAR NO VADE MECUM (OTIMIZADO PARA 4,81 MB)
+// 4. BUSCAR NO VADE MECUM (OTIMIZADO)
 // ============================================================
 function buscarNoVadeMecum(pergunta) {
   if (!vadeMecumCarregado || !vadeMecumText || vadeMecumText.length === 0) {
@@ -120,11 +122,10 @@ function buscarNoVadeMecum(pergunta) {
   const perguntaLower = pergunta.toLowerCase();
   const resultados = [];
 
-  // 4a. Busca por artigo específico (ex: "artigo 5", "art. 5", "Art. 5º")
+  // Busca por artigo específico
   const matchArtigo = pergunta.match(/art(?:igo)?\s*[º°]?\s*(\d+)/i);
   if (matchArtigo) {
     const num = matchArtigo[1];
-    // Tenta vários padrões de formatação do artigo
     const padroes = [
       `art. ${num}`,
       `art. ${num}º`,
@@ -137,7 +138,6 @@ function buscarNoVadeMecum(pergunta) {
     for (const busca of padroes) {
       const idx = vadeMecumText.toLowerCase().indexOf(busca);
       if (idx !== -1) {
-        // Pega 100 caracteres antes e 800 depois
         const inicio = Math.max(0, idx - 100);
         const fim = Math.min(vadeMecumText.length, idx + 800);
         const trecho = vadeMecumText.substring(inicio, fim);
@@ -147,7 +147,7 @@ function buscarNoVadeMecum(pergunta) {
     }
   }
 
-  // 4b. Busca por palavras-chave (limitado a 3 palavras, para performance)
+  // Busca por palavras-chave
   if (resultados.length === 0) {
     const palavras = perguntaLower
       .split(/\s+/)
@@ -157,12 +157,11 @@ function buscarNoVadeMecum(pergunta) {
     for (const palavra of palavras) {
       const idx = vadeMecumText.toLowerCase().indexOf(palavra);
       if (idx !== -1) {
-        // Pega 200 caracteres antes e 300 depois
         const inicio = Math.max(0, idx - 200);
         const fim = Math.min(vadeMecumText.length, idx + 300);
         const trecho = vadeMecumText.substring(inicio, fim);
         resultados.push(`🔍 **Resultado para "${palavra}":**\n${trecho.trim()}`);
-        break; // Para após encontrar a primeira palavra
+        break;
       }
     }
   }
@@ -187,7 +186,34 @@ async function buscarContexto(pergunta) {
 }
 
 // ============================================================
-// 6. VALIDAÇÃO DA API KEY
+// 6. FUNÇÃO PARA CHAMAR O CEREBRAS (FALLBACK)
+// ============================================================
+async function chamarCerebras(messages, maxTokens = 512) {
+  const response = await fetch(CEREBRAS_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${CEREBRAS_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: "llama-3.3-70b",
+      messages: messages,
+      temperature: 0.7,
+      max_tokens: maxTokens,
+    })
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(`Cerebras API error: ${response.status} - ${errorData.error?.message || 'Unknown error'}`);
+  }
+
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content || "Desculpe, não consegui gerar uma resposta.";
+}
+
+// ============================================================
+// 7. VALIDAÇÃO DA API KEY
 // ============================================================
 function validarApiKey() {
   if (!GROQ_API_KEY) {
@@ -198,7 +224,7 @@ function validarApiKey() {
 }
 
 // ============================================================
-// 7. FUNÇÃO PRINCIPAL (HANDLER)
+// 8. FUNÇÃO PRINCIPAL (HANDLER) COM FALLBACK
 // ============================================================
 module.exports = async (req, res) => {
   // CORS
@@ -216,7 +242,7 @@ module.exports = async (req, res) => {
   }
 
   try {
-    // Validar API Key
+    // Validar API Key da Groq
     if (!validarApiKey()) {
       return res.status(500).json({ 
         reply: '❌ Erro de configuração do servidor. Contate o administrador.' 
@@ -234,10 +260,10 @@ module.exports = async (req, res) => {
 
     console.log("📩 Mensagem recebida:", message);
 
-    // Buscar contexto (agora com Vade Mecum)
+    // Buscar contexto
     const contexto = await buscarContexto(message);
 
-    // Montar mensagens para a Groq
+    // Montar mensagens
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...(history || []).map(msg => ({
@@ -250,30 +276,68 @@ module.exports = async (req, res) => {
       }
     ];
 
-    // Chamar a API da Groq
-    const response = await fetch(GROQ_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${GROQ_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
-        messages: messages,
-        temperature: 0.7,
-        max_tokens: 1024,
-      })
-    });
+    let reply;
+    let usedProvider = 'groq';
 
-    if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(`Groq API error: ${response.status} - ${errorData.error?.message || 'Unknown error'}`);
+    // ============================================================
+    // TENTA GROQ PRIMEIRO
+    // ============================================================
+    try {
+      const response = await fetch(GROQ_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${GROQ_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: "llama-3.3-70b-versatile",
+          messages: messages,
+          temperature: 0.7,
+          max_tokens: 512, // Reduzido para economizar tokens
+        })
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(`Groq API error: ${response.status} - ${errorData.error?.message || 'Unknown error'}`);
+      }
+
+      const data = await response.json();
+      reply = data.choices?.[0]?.message?.content;
+      if (reply) {
+        usedProvider = 'groq';
+        console.log("✅ Resposta gerada com Groq!");
+      } else {
+        throw new Error("Resposta vazia da Groq");
+      }
+
+    } catch (groqError) {
+      console.warn("❌ Groq falhou:", groqError.message);
+      
+      // ============================================================
+      // FALLBACK PARA CEREBRAS
+      // ============================================================
+      if (CEREBRAS_API_KEY) {
+        try {
+          console.log("🔄 Usando Cerebras como fallback...");
+          reply = await chamarCerebras(messages, 512);
+          usedProvider = 'cerebras';
+          console.log("✅ Resposta gerada com Cerebras!");
+        } catch (cerebrasError) {
+          console.error("❌ Cerebras também falhou:", cerebrasError.message);
+          throw new Error(`Ambas as APIs falharam: Groq (${groqError.message}) e Cerebras (${cerebrasError.message})`);
+        }
+      } else {
+        throw groqError;
+      }
     }
 
-    const data = await response.json();
-    const reply = data.choices?.[0]?.message?.content || "Desculpe, não consegui gerar uma resposta.";
+    // Se chegou aqui sem reply, algo deu errado
+    if (!reply) {
+      reply = "Desculpe, não consegui gerar uma resposta. Tente novamente mais tarde.";
+    }
 
-    console.log("✅ Resposta gerada com sucesso!");
+    console.log(`✅ Resposta gerada com ${usedProvider}!`);
     return res.status(200).json({ reply });
 
   } catch (error) {
